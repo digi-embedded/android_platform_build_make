@@ -382,8 +382,9 @@ def _BuildBootableImage(sourcedir, fs_config_file, info_dict=None,
   for building the requested image.
   """
 
-  def make_ramdisk():
+  def make_ramdisk(arch="arm", name="uramdisk.img", desc="Android U-Boot ramdisk"):
     ramdisk_img = tempfile.NamedTemporaryFile()
+    urf_path = os.path.join(os.path.dirname(ramdisk_img.name), name)
 
     if os.access(fs_config_file, os.F_OK):
       cmd = ["mkbootfs", "-f", fs_config_file,
@@ -398,7 +399,20 @@ def _BuildBootableImage(sourcedir, fs_config_file, info_dict=None,
     assert p1.returncode == 0, "mkbootfs of %s ramdisk failed" % (sourcedir,)
     assert p2.returncode == 0, "minigzip of %s ramdisk failed" % (sourcedir,)
 
-    return ramdisk_img
+    urd_cmd = ["mkimage", "-A", arch, "-O", "linux", "-T", "ramdisk", "-n",
+               desc, "-d", ramdisk_img.name, urf_path]
+    p1 = Run(urd_cmd, stdout=subprocess.PIPE)
+
+    p1.communicate()
+    assert p1.returncode == 0, "mkimage of %s ramdisk failed" % (sourcedir,)
+
+    # Clean up the temp files.
+    ramdisk_img.close()
+
+    urf = open(urf_path, 'rb')
+    uramdisk_img = tempfile._TemporaryFileWrapper(urf, urf_path, True)
+
+    return uramdisk_img
 
   if not os.access(os.path.join(sourcedir, "kernel"), os.F_OK):
     return None
@@ -410,64 +424,81 @@ def _BuildBootableImage(sourcedir, fs_config_file, info_dict=None,
     info_dict = OPTIONS.info_dict
 
   img = tempfile.NamedTemporaryFile()
-
-  if has_ramdisk:
-    ramdisk_img = make_ramdisk()
-
-  # use MKBOOTIMG from environ, or "mkbootimg" if empty or not set
-  mkbootimg = os.getenv('MKBOOTIMG') or "mkbootimg"
-
-  cmd = [mkbootimg, "--kernel", os.path.join(sourcedir, "kernel")]
-
-  fn = os.path.join(sourcedir, "second")
-  if os.access(fn, os.F_OK):
-    cmd.append("--second")
-    cmd.append(fn)
-
-  fn = os.path.join(sourcedir, "cmdline")
-  if os.access(fn, os.F_OK):
-    cmd.append("--cmdline")
-    cmd.append(open(fn).read().rstrip("\n"))
-
-  fn = os.path.join(sourcedir, "base")
-  if os.access(fn, os.F_OK):
-    cmd.append("--base")
-    cmd.append(open(fn).read().rstrip("\n"))
-
-  fn = os.path.join(sourcedir, "pagesize")
-  if os.access(fn, os.F_OK):
-    cmd.append("--pagesize")
-    cmd.append(open(fn).read().rstrip("\n"))
-
-  args = info_dict.get("mkbootimg_args", None)
-  if args and args.strip():
-    cmd.extend(shlex.split(args))
-
-  args = info_dict.get("mkbootimg_version_args", None)
-  if args and args.strip():
-    cmd.extend(shlex.split(args))
-
-  if has_ramdisk:
-    cmd.extend(["--ramdisk", ramdisk_img.name])
-
-  img_unsigned = None
-  if info_dict.get("vboot", None):
-    img_unsigned = tempfile.NamedTemporaryFile()
-    cmd.extend(["--output", img_unsigned.name])
-  else:
-    cmd.extend(["--output", img.name])
+  img_path = img.name
+  img.close()
 
   # "boot" or "recovery", without extension.
   partition_name = os.path.basename(sourcedir).lower()
+  volume_name = "BOOT"
+  partition_size = info_dict.get("boot_size") / 1024
+  ramdisk_name = "uramdisk.img"
+  ramdisk_desc = "Android U-Boot ramdisk"
+  if partition_name == "recovery":
+    volume_name = "RECOVERY"
+    partition_size = info_dict.get("recovery_size") / 1024
+    ramdisk_name = "uramdisk-recovery.img"
+    ramdisk_desc = "Android U-Boot recovery ramdisk"
 
-  if (partition_name == "recovery" and
-      info_dict.get("include_recovery_dtbo") == "true"):
-    fn = os.path.join(sourcedir, "recovery_dtbo")
-    cmd.extend(["--recovery_dtbo", fn])
+  if has_ramdisk:
+    ramdisk_img = make_ramdisk(info_dict.get("arch"), ramdisk_name, ramdisk_desc)
 
-  p = Run(cmd, stdout=subprocess.PIPE)
+  mkfs_cmd = ["mkfs.vfat", "-a", "-n", "\"" + volume_name + "\"", "-S", "512", "-C"]
+  parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+  fat16copy_cmd = [os.path.join(parent_dir, "fat16copy.py")]
+  if not os.path.isfile(fat16copy_cmd[0]):
+    fat16copy_cmd = [os.path.join(parent_dir, "build/tools/fat16copy.py")]
+
+  img_unsigned = None
+  img_unsigned_path = None
+  if info_dict.get("vboot", None):
+    img_unsigned = tempfile.NamedTemporaryFile()
+    img_unsigned_path = img_unsigned.name
+    img_unsigned.close()
+    mkfs_cmd.append(img_unsigned_path)
+    fat16copy_cmd.append(img_unsigned_path)
+  else:
+    mkfs_cmd.append(img_path)
+    fat16copy_cmd.append(img_path)
+
+  mkfs_cmd.append(str(partition_size))
+
+  p = Run(mkfs_cmd, stdout=subprocess.PIPE)
   p.communicate()
-  assert p.returncode == 0, "mkbootimg of %s image failed" % (partition_name,)
+  assert p.returncode == 0, "mkfs.vfat of %s image failed" % (partition_name,)
+
+  # Rename kernel to Image.gz
+  kf_path = os.path.join(tempfile.gettempdir(), "Image.gz")
+  shutil.copyfile(os.path.join(sourcedir, "kernel"), kf_path)
+  fat16copy_cmd.append(kf_path)
+  files_size = os.stat(kf_path).st_size
+  for f in os.listdir(sourcedir):
+    if f.endswith(".dtb"):
+      path = os.path.join(sourcedir, f)
+      fat16copy_cmd.append(path)
+      files_size = files_size + os.stat(path).st_size
+
+  fat16copy_cmd.append(os.path.join(sourcedir, "boot.scr"))
+  fat16copy_cmd.append(ramdisk_img.name)
+  files_size = (files_size
+                + os.stat(os.path.join(sourcedir, "boot.scr")).st_size
+                + os.stat(ramdisk_img.name).st_size)
+
+  p = Run(fat16copy_cmd, stdout=subprocess.PIPE)
+  p.communicate()
+  assert p.returncode == 0, "fat16copy of %s image failed" % (partition_name,)
+
+  files_size = files_size * (100 + 10) / 100
+  files_size = int(((files_size + 511) / 512) * 512)
+
+  f = open(img_path, 'r+b')
+  if info_dict.get("vboot", None):
+    uf = open(img_unsigned_path, 'r+b')
+    uf.truncate(files_size)
+    img_unsigned = tempfile._TemporaryFileWrapper(uf, img_unsigned_path, True)
+  else:
+    f.truncate(files_size)
+
+  img = tempfile._TemporaryFileWrapper(f, img_path, True)
 
   if (info_dict.get("boot_signer", None) == "true" and
       info_dict.get("verity_key", None)):
